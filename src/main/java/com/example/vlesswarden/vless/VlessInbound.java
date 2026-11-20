@@ -124,6 +124,24 @@ public class VlessInbound {
         this.enabled = true;
     }
 
+    /**
+     * Неотсоелённая копия с новыми настройками: позволяет собрать
+     * config.json при перепровижении, пока настройки ещё не записаны в БД.
+     */
+    public VlessInbound withSettings(int listenPort, String dest, String serverNames, String shortIds,
+                                     String fingerprint, String flow) {
+        VlessInbound copy = new VlessInbound(serverId, tag, listenPort, dest, serverNames, shortIds,
+                publicKey, encryptedPrivateKey, fingerprint, flow);
+        copy.id = this.id;
+        copy.status = this.status;
+        copy.lastError = this.lastError;
+        copy.xrayVersion = this.xrayVersion;
+        copy.firewallPort = this.firewallPort;
+        copy.createdAt = this.createdAt;
+        copy.enabled = true;
+        return copy;
+    }
+
     /** Запоминает порт, для которого панель открыла правило UFW. */
     public void markFirewallAdded(int port) {
         this.firewallPort = port;

@@ -13,10 +13,12 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import com.example.vlesswarden.server.ServerNotFoundException;
 import com.example.vlesswarden.ssh.SshConnectionException;
 import com.example.vlesswarden.vless.VlessNotFoundException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 @RestControllerAdvice
@@ -58,6 +60,18 @@ public class ApiExceptionHandler {
                 .map(err -> err.getField() + " " + err.getDefaultMessage())
                 .orElse("invalid request");
         return ResponseEntity.badRequest().body(new ErrorResponse(message));
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    ResponseEntity<ErrorResponse> typeMismatch(MethodArgumentTypeMismatchException e) {
+        return ResponseEntity.badRequest().body(new ErrorResponse("invalid request parameter"));
+    }
+
+    @ExceptionHandler(OptimisticLockingFailureException.class)
+    ResponseEntity<ErrorResponse> optimisticLocking(OptimisticLockingFailureException e) {
+        log.warn("Optimistic locking failure: {}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(
+                new ErrorResponse("request conflicts with current data; reload the page and retry"));
     }
 
     @ExceptionHandler(ServerNotFoundException.class)

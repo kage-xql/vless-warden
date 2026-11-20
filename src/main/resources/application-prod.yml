@@ -7,8 +7,9 @@ spring:
       minimum-idle: 2
 
 server:
-  # Если позже появится TLS-прокси, X-Forwarded-* будут учтены.
-  forward-headers-strategy: framework
+  # nginx перезаписывает X-Real-IP, X-Forwarded-For и Forwarded фактом
+  # соединения: forward-headers-strategy включать не следует, чтобы
+  # заголовки от клиента не считались доверенной информацией.
   tomcat:
     max-connections: 256
     accept-count: 64

@@ -3,6 +3,7 @@ package com.example.vlesswarden.monitoring;
 import com.example.vlesswarden.server.Server;
 import com.example.vlesswarden.server.ServerCredentialService;
 import com.example.vlesswarden.server.ServerRepository;
+import com.example.vlesswarden.server.ServerStatus;
 import com.example.vlesswarden.ssh.SshClientService;
 import com.example.vlesswarden.vless.VlessClient;
 import com.example.vlesswarden.vless.VlessClientMetric;
@@ -17,6 +18,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Duration;
@@ -86,7 +88,7 @@ public class MonitoringService {
                              VlessClientMetricRepository clientMetrics, SshClientService ssh,
                              ServerCredentialService credentials, VlessClientService clientService,
                              MonitoringEventHub events,
-                             org.springframework.transaction.PlatformTransactionManager txManager,
+                             PlatformTransactionManager txManager,
                              @Value("${app.monitoring.retention:30d}") Duration retention) {
         this.servers = servers;
         this.inbounds = inbounds;
@@ -116,17 +118,18 @@ public class MonitoringService {
         for (Server server : servers.findAll()) {
             UUID id = server.getId();
             try {
-                CollectionResult result = transactions.execute(status -> collectOne(id));
+                CollectionResult result = collectOne(id);
                 if (result == null) continue;
 
-                // Отключаем клиентов после коммита: удалённый вызов нельзя держать
-                // внутри транзакции, иначе блокировка строки и VlessOperationLock
-                // могут образовать взаимную блокировку с параллельным редактированием.
+                // SSH и другие удалённые вызовы выполняются уже вне транзакции:
+                // они могут секунды, а удержание строки и VlessOperationLock
+                // блокирует параллельное редактирование клиентов/сервера.
                 Set<UUID> disabled = new HashSet<>();
                 for (UUID clientId : result.pendingDisables()) {
                     try {
-                        clientService.disableForLimit(clientId);
-                        disabled.add(clientId);
+                        if (clientService.disableForLimit(clientId)) {
+                            disabled.add(clientId);
+                        }
                     } catch (RuntimeException e) {
                         log.warn("Could not disable limited VLESS client {}", clientId, e);
                     }
@@ -140,28 +143,12 @@ public class MonitoringService {
                         result.update().status(), result.update().connectionError(),
                         result.update().server(), clients));
             } catch (RuntimeException e) {
-                Throwable root = e;
-                while (root.getCause() != null && root.getCause() != root) root = root.getCause();
-                String reason = root.getMessage() == null ? root.getClass().getSimpleName() : root.getMessage();
-                log.warn("Monitoring failed for server {}: {}", id, reason, e);
-                try {
-                    transactions.execute(status -> {
-                        servers.findById(id).ifPresent(current -> {
-                            String message = "Monitoring failed: " + reason;
-                            if (message.length() > 250) message = message.substring(0, 247) + "...";
-                            current.markError(message);
-                            events.publish(current.getUserId(),
-                                    new MonitorUpdate(id, current.getStatus().name(), message, null, List.of()));
-                        });
-                        return null;
-                    });
-                } catch (RuntimeException markError) {
-                    log.warn("Could not persist monitoring error for {}", id, markError);
-                }
+                markError(server, id, e);
             }
         }
     }
 
+    /** SSH-сбор и парсинг вне транзакции, затем одна транзакция сохранения. */
     private CollectionResult collectOne(UUID serverId) {
         Server server = servers.findById(serverId).orElse(null);
         if (server == null || server.getHostKeyFingerprint() == null) return null;
@@ -169,6 +156,10 @@ public class MonitoringService {
         String output = ssh.runSudoScript(server.getHost(), server.getSshPort(), server.getSshUser(),
                 credentials.decrypt(server), server.getHostKeyFingerprint(), COLLECT_SCRIPT);
 
+        return transactions.execute(status -> persistMetrics(serverId, output));
+    }
+
+    private CollectionResult persistMetrics(UUID serverId, String output) {
         Instant now = Instant.now();
         ServerMetric serverMetric = null;
         Map<String, long[]> traffic = new HashMap<>();
@@ -203,16 +194,16 @@ public class MonitoringService {
                 long deltaTx = current[1] >= previousTx ? current[1] - previousTx : current[1];
                 long delta = deltaRx + deltaTx;
                 if (delta > 0) {
-                    client.addTrafficUsedBytes(delta);
-                    clients.save(client);
+                    clients.addTraffic(client.getId(), delta);
                 }
+                long used = client.getTrafficUsedBytes() + Math.max(delta, 0);
 
                 VlessClientMetric metric = clientMetrics.save(new VlessClientMetric(
                         client.getId(), now, current[0], current[1], online.contains(client.getEmail())));
 
                 boolean expired = client.getExpiresAt() != null && !client.getExpiresAt().isAfter(now);
                 boolean overTraffic = client.getTrafficLimitBytes() != null
-                        && client.getTrafficUsedBytes() >= client.getTrafficLimitBytes();
+                        && used >= client.getTrafficLimitBytes();
                 if ((expired || overTraffic) && client.isEnabled()) {
                     pendingDisables.add(client.getId());
                 }
@@ -221,11 +212,35 @@ public class MonitoringService {
             }
         }
 
-        server.markOnline();
-        servers.save(server);
-        MonitorUpdate update = new MonitorUpdate(serverId, server.getStatus().name(),
+        // Точечное обновление статуса: save() на сервере затёр бы изменения
+        // host/credentials, сделанные пользователем за время SSH-сбора.
+        servers.updateStatus(serverId, ServerStatus.ONLINE, null);
+        MonitorUpdate update = new MonitorUpdate(serverId, ServerStatus.ONLINE.name(),
                 null, ServerMetricResponse.from(serverMetric), updates);
         return new CollectionResult(pendingDisables, update);
+    }
+
+    private void markError(Server server, UUID id, RuntimeException e) {
+        Throwable root = e;
+        while (root.getCause() != null && root.getCause() != root) root = root.getCause();
+        String reason = root.getMessage() == null ? root.getClass().getSimpleName() : root.getMessage();
+        log.warn("Monitoring failed for server {}: {}", id, reason, e);
+        String message = monitoringError(reason);
+        try {
+            transactions.execute(status -> {
+                servers.updateStatus(id, ServerStatus.ERROR, message);
+                return null;
+            });
+        } catch (RuntimeException markError) {
+            log.warn("Could not persist monitoring error for {}", id, markError);
+        }
+        events.publish(server.getUserId(),
+                new MonitorUpdate(id, ServerStatus.ERROR.name(), message, null, List.of()));
+    }
+
+    private static String monitoringError(String reason) {
+        String message = "Monitoring failed: " + reason;
+        return message.length() > 250 ? message.substring(0, 247) + "..." : message;
     }
 
     private record CollectionResult(List<UUID> pendingDisables, MonitorUpdate update) {

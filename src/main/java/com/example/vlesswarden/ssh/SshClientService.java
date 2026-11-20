@@ -3,6 +3,7 @@ package com.example.vlesswarden.ssh;
 import org.apache.sshd.client.SshClient;
 import org.apache.sshd.client.session.ClientSession;
 import org.apache.sshd.common.config.keys.FilePasswordProvider;
+import org.apache.sshd.common.config.keys.KeyUtils;
 import org.apache.sshd.common.util.security.SecurityUtils;
 import org.springframework.stereotype.Service;
 import org.slf4j.Logger;
@@ -10,8 +11,6 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.security.PublicKey;
-import java.security.MessageDigest;
-import java.util.Base64;
 import java.util.concurrent.TimeUnit;
 
 @Service
@@ -126,7 +125,7 @@ public class SshClientService {
             return out.toString(StandardCharsets.UTF_8);
         }
     }
-    private String fingerprint(PublicKey key) throws Exception { return "SHA256:"+Base64.getEncoder().withoutPadding().encodeToString(MessageDigest.getInstance("SHA-256").digest(key.getEncoded())); }
+    private String fingerprint(PublicKey key) { return KeyUtils.getFingerPrint(key); }
 
     /** Ограничивает объём вывода, чтобы скомпрометированный сервер не исчерпал память панели. */
     private static final class LimitedOutputStream extends OutputStream {

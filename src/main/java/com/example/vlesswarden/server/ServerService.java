@@ -4,6 +4,7 @@ import com.example.vlesswarden.ssh.SshClientService;
 import com.example.vlesswarden.ssh.SshConnectionException;
 import com.example.vlesswarden.vless.VlessInbound;
 import com.example.vlesswarden.vless.VlessInboundRepository;
+import com.example.vlesswarden.vless.VlessOperationLock;
 import com.example.vlesswarden.vless.VlessRemoteService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,14 +23,17 @@ public class ServerService {
     private final ServerCredentialService credentials;
     private final SshClientService ssh;
     private final VlessRemoteService vless;
+    private final VlessOperationLock lock;
 
     public ServerService(ServerRepository repository, VlessInboundRepository inbounds,
-                         ServerCredentialService credentials, SshClientService ssh, VlessRemoteService vless) {
+                         ServerCredentialService credentials, SshClientService ssh,
+                         VlessRemoteService vless, VlessOperationLock lock) {
         this.repository = repository;
         this.inbounds = inbounds;
         this.credentials = credentials;
         this.ssh = ssh;
         this.vless = vless;
+        this.lock = lock;
     }
 
     @Transactional(readOnly = true)
@@ -65,36 +69,40 @@ public class ServerService {
 
     public ServerResponse update(UUID user, UUID id, ServerRequest request) {
         validateHost(request.host());
-        Server server = owned(user, id);
-        byte[] encrypted = null;
-        if (request.credentials() != null) {
-            validateCredentials(request.credentials());
-            encrypted = credentials.encrypt(request.credentials());
-        }
-        server.update(request.name().trim(), request.host().trim(), request.sshPort(),
-                request.sshUser().trim(), encrypted);
-        repository.save(server);
-        var sshCredentials = request.credentials() == null
-                ? credentials.decrypt(server)
-                : credentials.toCredentials(request.credentials());
-        // trustNewHostKey — явное действие пользователя после переустановки VPS.
-        String pinned = Boolean.TRUE.equals(request.trustNewHostKey()) ? null : server.getHostKeyFingerprint();
-        try {
-            var result = ssh.probe(server.getHost(), server.getSshPort(), server.getSshUser(), sshCredentials, pinned);
-            server.connectionResult(result.fingerprint(), result.operatingSystem());
-        } catch (RuntimeException e) {
-            server.markError(connectionError(e));
-        }
-        repository.save(server);
-        return ServerResponse.from(server);
+        return lock.withLock(id, () -> {
+            Server server = owned(user, id);
+            byte[] encrypted = null;
+            if (request.credentials() != null) {
+                validateCredentials(request.credentials());
+                encrypted = credentials.encrypt(request.credentials());
+            }
+            server.update(request.name().trim(), request.host().trim(), request.sshPort(),
+                    request.sshUser().trim(), encrypted);
+            repository.save(server);
+            var sshCredentials = request.credentials() == null
+                    ? credentials.decrypt(server)
+                    : credentials.toCredentials(request.credentials());
+            // trustNewHostKey — явное действие пользователя после переустановки VPS.
+            String pinned = Boolean.TRUE.equals(request.trustNewHostKey()) ? null : server.getHostKeyFingerprint();
+            try {
+                var result = ssh.probe(server.getHost(), server.getSshPort(), server.getSshUser(), sshCredentials, pinned);
+                server.connectionResult(result.fingerprint(), result.operatingSystem());
+            } catch (RuntimeException e) {
+                server.markError(connectionError(e));
+            }
+            repository.save(server);
+            return ServerResponse.from(server);
+        });
     }
 
     public void delete(UUID user, UUID id) {
-        Server server = owned(user, id);
-        // Сначала отзываем VLESS-доступ на самом VPS. Если это не удалось,
-        // запись не удаляем, чтобы пользователь не считал доступ закрытым.
-        removeVless(server);
-        repository.delete(server);
+        lock.withLock(id, () -> {
+            Server server = owned(user, id);
+            // Сначала отзываем VLESS-доступ на самом VPS. Если это не удалось,
+            // запись не удаляем, чтобы пользователь не считал доступ закрытым.
+            removeVless(server);
+            repository.delete(server);
+        });
     }
 
     private void removeVless(Server server) {

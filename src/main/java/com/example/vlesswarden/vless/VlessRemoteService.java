@@ -113,6 +113,8 @@ public class VlessRemoteService {
     private static final String PROVISION_SCRIPT = """
             set -euo pipefail
             export DEBIAN_FRONTEND=noninteractive
+            exec 9>/run/lock/vless-warden.lock
+            flock -x 9
             PORT={{PORT}}
             OLD_PORT={{OLD_PORT}}
             BIN_DIR=/opt/vless-warden/bin
@@ -126,7 +128,12 @@ public class VlessRemoteService {
               useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE"
             fi
             install -d -m 755 /opt/vless-warden "$BIN_DIR"
-            install -d -m 750 -o root -g "$SERVICE" "$CONFIG_DIR" "$LOG_DIR"
+            install -d -m 750 -o root -g "$SERVICE" "$CONFIG_DIR"
+            # vless-warden должен писать лог: каталог логов и error.log доступны пользователю сервиса.
+            install -d -m 770 -o root -g "$SERVICE" "$LOG_DIR"
+            chmod 770 "$LOG_DIR" 2>/dev/null || true
+            touch "$LOG_DIR/error.log" 2>/dev/null || true
+            chown "$SERVICE:$SERVICE" "$LOG_DIR/error.log" 2>/dev/null || true
 
             if command -v ss >/dev/null 2>&1; then
               if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}$"; then
@@ -170,8 +177,9 @@ public class VlessRemoteService {
             printf '%s' '{{CONFIG_B64}}' | base64 -d > "$CONFIG.new"
             chown root:"$SERVICE" "$CONFIG.new"
             chmod 640 "$CONFIG.new"
-            "$XRAY" -test -config "$CONFIG.new" >/dev/null
+            # Xray определяет формат конфига по имени файла — сначала .new переименуем в $CONFIG.
             mv "$CONFIG.new" "$CONFIG"
+            "$XRAY" -test -config "$CONFIG" >/dev/null
 
             cat > /etc/systemd/system/vless-warden.service <<'UNIT'
             [Unit]
@@ -243,12 +251,16 @@ public class VlessRemoteService {
             printf '%s' '{{CONFIG_B64}}' | base64 -d > "$CONFIG.new"
             chown root:"$SERVICE" "$CONFIG.new"
             chmod 640 "$CONFIG.new"
-            "$XRAY" -test -config "$CONFIG.new" >/dev/null
+            # Xray определяет формат конфига по имени файла — сначала .new переименуем в $CONFIG.
             mv "$CONFIG.new" "$CONFIG"
+            "$XRAY" -test -config "$CONFIG" >/dev/null
 
             printf '%s' '{{USER_B64}}' | base64 -d > "$user_file"
             chmod 600 "$user_file"
-            if ! "$XRAY" api adu --server=127.0.0.1:10085 "$user_file" >/dev/null 2>&1; then
+            # xray api adu завершается 0 даже при ошибке, поэтому успех проверяем
+            # по выводу: если нет "result: ok", перезапускаем Xray.
+            if ! add_output=$("$XRAY" api adu --server=127.0.0.1:10085 "$user_file" 2>&1) \\
+               || ! printf '%s\\n' "$add_output" | grep -q 'result: ok'; then
               if ! systemctl restart "$SERVICE"; then
                 cp -p "$backup" "$CONFIG"
                 systemctl restart "$SERVICE" >/dev/null 2>&1 || true
@@ -279,10 +291,13 @@ public class VlessRemoteService {
             printf '%s' '{{CONFIG_B64}}' | base64 -d > "$CONFIG.new"
             chown root:"$SERVICE" "$CONFIG.new"
             chmod 640 "$CONFIG.new"
-            "$XRAY" -test -config "$CONFIG.new" >/dev/null
+            # Xray определяет формат конфига по имени файла — сначала .new переименуем в $CONFIG.
             mv "$CONFIG.new" "$CONFIG"
+            "$XRAY" -test -config "$CONFIG" >/dev/null
 
-            if ! "$XRAY" api rmu --server=127.0.0.1:10085 -tag={{TAG}} '{{EMAIL}}' >/dev/null 2>&1; then
+            # xray api rmu завершается 0 даже при ошибке: проверяем "Removed N user".
+            if ! remove_output=$("$XRAY" api rmu --server=127.0.0.1:10085 -tag={{TAG}} '{{EMAIL}}' 2>&1) \\
+               || ! printf '%s\\n' "$remove_output" | grep -qE 'Removed [1-9][0-9]* user(s)?'; then
               if ! systemctl restart "$SERVICE"; then
                 cp -p "$backup" "$CONFIG"
                 systemctl restart "$SERVICE" >/dev/null 2>&1 || true
@@ -314,13 +329,24 @@ public class VlessRemoteService {
             printf '%s' '{{CONFIG_B64}}' | base64 -d > "$CONFIG.new"
             chown root:"$SERVICE" "$CONFIG.new"
             chmod 640 "$CONFIG.new"
-            "$XRAY" -test -config "$CONFIG.new" >/dev/null
+            # Xray определяет формат конфига по имени файла — сначала .new переименуем в $CONFIG.
             mv "$CONFIG.new" "$CONFIG"
+            "$XRAY" -test -config "$CONFIG" >/dev/null
 
-            "$XRAY" api rmu --server=127.0.0.1:10085 -tag={{TAG}} '{{EMAIL}}' >/dev/null 2>&1 || true
+            # Проверяем оба шага: если хотя бы один не подтвердился выводом,
+            # перезапускаем Xray.
+            remove_failed=0
+            remove_output=$("$XRAY" api rmu --server=127.0.0.1:10085 -tag={{TAG}} '{{EMAIL}}' 2>&1) \\
+               || remove_failed=1
             printf '%s' '{{USER_B64}}' | base64 -d > "$user_file"
             chmod 600 "$user_file"
-            if ! "$XRAY" api adu --server=127.0.0.1:10085 "$user_file" >/dev/null 2>&1; then
+            add_failed=0
+            add_output=$("$XRAY" api adu --server=127.0.0.1:10085 "$user_file" 2>&1) \\
+               || add_failed=1
+            if [ "$remove_failed" = 1 ] \\
+               || [ "$add_failed" = 1 ] \\
+               || ! printf '%s\\n' "$remove_output" | grep -qE 'Removed [1-9][0-9]* user(s)?' \\
+               || ! printf '%s\\n' "$add_output" | grep -q 'result: ok'; then
               if ! systemctl restart "$SERVICE"; then
                 cp -p "$backup" "$CONFIG"
                 systemctl restart "$SERVICE" >/dev/null 2>&1 || true

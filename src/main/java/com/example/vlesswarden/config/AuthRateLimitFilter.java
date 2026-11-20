@@ -6,8 +6,10 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.web.util.UriUtils;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -32,8 +34,7 @@ public final class AuthRateLimitFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
-        String path = request.getRequestURI();
-        if (!path.equals("/api/auth/login") && !path.equals("/api/auth/register")) {
+        if (!isAuthPath(request)) {
             chain.doFilter(request, response);
             return;
         }
@@ -51,7 +52,39 @@ public final class AuthRateLimitFilter extends OncePerRequestFilter {
         chain.doFilter(request, response);
     }
 
-    /** Не даём карте окон расти бесконечно при сканировании с разных адресов. */
+    /**
+     * Применяется ко всем {@code /api/auth/*}. Путь нормализуется: декодируем
+     * процент-кодировку, вырезаем матричные параметры и схлопываем
+     * повторные слэши, чтобы `/api;x/auth/login` и `//api//auth//login` не
+     * обходили лимит.
+     */
+    static boolean isAuthPath(HttpServletRequest request) {
+        String path = normalizedPath(request);
+        return path.startsWith("/api/auth/");
+    }
+
+    static String normalizedPath(HttpServletRequest request) {
+        String uri = request.getRequestURI();
+        String context = request.getContextPath();
+        if (context != null && !context.isEmpty() && uri.startsWith(context)) {
+            uri = uri.substring(context.length());
+        }
+        try {
+            uri = UriUtils.decode(uri, StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder(uri.length());
+        for (String segment : uri.split("/", -1)) {
+            int semicolon = segment.indexOf(';');
+            String clean = semicolon < 0 ? segment : segment.substring(0, semicolon);
+            if (clean.isEmpty()) continue;
+            out.append('/').append(clean);
+        }
+        return out.isEmpty() ? "/" : out.toString();
+    }
+
+    /** Не даёт карте окон расти бесконечно при сканировании с разных адресов. */
     @Scheduled(fixedRate = 60_000)
     public void removeExpiredWindows() {
         long now = Instant.now().getEpochSecond();

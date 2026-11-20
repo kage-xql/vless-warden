@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import vlessDragonLogo from './assets/vless-dragon.png'
 import { Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { api, ApiError, AUTH_EXPIRED_EVENT, TOKEN_KEY } from './api'
-import { bytes, clientLimit, dateTime, daysFromNow, gbToBytes, time } from './format'
+import { bytes, clientLimit, dateTime, daysFromNow, gbFromBytes, gbToBytes, time } from './format'
 import type {
   ClientMetric,
   ConfirmAction,
@@ -967,31 +967,68 @@ function LimitsDialog({ trafficGb, durationDays, onClose, onSave }: { trafficGb:
   )
 }
 
+function initialExpiryDays(expiresAt: string | null): string {
+  if (!expiresAt) return ''
+  const difference = new Date(expiresAt).getTime() - Date.now()
+  return difference > 0 ? String(Math.ceil(difference / 86_400_000)) : ''
+}
+
+function copyToClipboard(value: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(value).then(() => true).catch(() => {
+      // Переходим к fallback на временном элементе.
+      return copyWithElement(value)
+    })
+  }
+  return copyWithElement(value)
+}
+
+function copyWithElement(value: string): Promise<boolean> {
+  try {
+    const area = document.createElement('textarea')
+    area.value = value
+    area.setAttribute('readonly', '')
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.appendChild(area)
+    area.select()
+    const copied = document.execCommand('copy')
+    document.body.removeChild(area)
+    return Promise.resolve(copied)
+  } catch {
+    return Promise.resolve(false)
+  }
+}
+
 function ClientEditDialog({ token, client, onClose, onSaved }: { token: string; client: VlessClient; onClose: () => void; onSaved: (result: VlessClientCreation | null) => void }) {
   const [name, setName] = useState(client.name)
-  const [trafficGb, setTrafficGb] = useState(client.trafficLimitBytes ? String(Math.round((client.trafficLimitBytes / (1024 * 1024 * 1024)) * 10) / 10) : '')
-  const [durationDays, setDurationDays] = useState(() => {
-    if (!client.expiresAt) return ''
-    const difference = new Date(client.expiresAt).getTime() - Date.now()
-    return difference > 0 ? String(Math.ceil(difference / 86_400_000)) : ''
-  })
+  // Dirty-флаги: если поле не трогали, обновлять лимит/срок в БД не нужно —
+  // иначе текущие значения и округления во вводе затирали бы реальные.
+  const initialTraffic = gbFromBytes(client.trafficLimitBytes)
+  const initialDuration = initialExpiryDays(client.expiresAt)
+  const [trafficGb, setTrafficGb] = useState(initialTraffic)
+  const [durationDays, setDurationDays] = useState(initialDuration)
   const [enabled, setEnabled] = useState(client.enabled)
   const [rotateUuid, setRotateUuid] = useState(false)
   const [error, setError] = useState('')
+  const trafficChanged = trafficGb !== initialTraffic
+  const expiresChanged = durationDays !== initialDuration
   const save = useMutation({
     mutationFn: () => {
-      const gb = gbToBytes(trafficGb)
+      const body: Record<string, unknown> = { name: name.trim(), enabled, rotateUuid }
+      if (trafficChanged) {
+        const gb = gbToBytes(trafficGb)
+        body.trafficLimitBytes = gb
+        body.clearTrafficLimit = gb === null
+      }
+      if (expiresChanged) {
+        const expiresAt = daysFromNow(durationDays)
+        body.expiresAt = expiresAt
+        body.clearExpiresAt = expiresAt === null
+      }
       return api<VlessClientCreation>(`/api/vless/clients/${client.id}`, token, {
         method: 'PUT',
-        body: JSON.stringify({
-          name: name.trim(),
-          enabled,
-          trafficLimitBytes: gb,
-          clearTrafficLimit: gb === null,
-          expiresAt: daysFromNow(durationDays),
-          clearExpiresAt: !durationDays.trim() || daysFromNow(durationDays) === null,
-          rotateUuid,
-        }),
+        body: JSON.stringify(body),
       })
     },
     onSuccess: result => onSaved(result),
@@ -1070,11 +1107,7 @@ function ClientRow({ token, client, selected, disabled, onSelect, onEdit, onLink
   const copy = useMutation({
     mutationFn: () => api<VlessClientConfig>(`/api/vless/clients/${client.id}`, token),
     onSuccess: async result => {
-      try {
-        await navigator.clipboard.writeText(result.uri)
-      } catch {
-        onLink({ client, uri: result.uri })
-      }
+      if (!(await copyToClipboard(result.uri))) onLink({ client, uri: result.uri })
     },
     onError: caught => setError(caught.message),
   })
@@ -1164,14 +1197,14 @@ function ConfirmDialog({ action, onClose, onConfirm }: { action: ConfirmAction; 
 
 function LinkDialog({ link, onClose }: { link: VlessClientCreation; onClose: () => void }) {
   const [copied, setCopied] = useState(false)
+  const [failed, setFailed] = useState(false)
+  const area = useRef<HTMLTextAreaElement>(null)
   async function copy() {
-    try {
-      await navigator.clipboard.writeText(link.uri)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1800)
-    } catch {
-      setCopied(false)
-    }
+    const ok = await copyToClipboard(link.uri)
+    setCopied(ok)
+    setFailed(!ok)
+    if (ok) setTimeout(() => setCopied(false), 1800)
+    else { area.current?.focus(); area.current?.select() }
   }
   return (
     <div className="overlay">
@@ -1182,7 +1215,8 @@ function LinkDialog({ link, onClose }: { link: VlessClientCreation; onClose: () 
         <p className="dialog-copy">
           Import this link into a VLESS client. The UUID is stored encrypted and can be retrieved later; rotating it invalidates the old link.
         </p>
-        <textarea className="config-output" readOnly rows={8} style={{ resize: 'none' }} value={link.uri} />
+        <textarea className="config-output" readOnly rows={8} style={{ resize: 'none' }} ref={area} value={link.uri} />
+        {failed && <div className="row-error">Clipboard is unavailable — select the link above and press Ctrl/Cmd+C.</div>}
         <div className="dialog-actions">
           <button className="button quiet" onClick={() => void copy()}>{copied ? 'Copied' : 'Copy link'}</button>
           <button className="button primary" onClick={onClose}>Close</button>

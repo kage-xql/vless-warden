@@ -7,10 +7,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Function;
 
 @Service
 public class VlessClientService {
@@ -43,10 +45,15 @@ public class VlessClientService {
     }
 
     public VlessClientCreationResponse create(UUID userId, UUID serverId, VlessClientRequest request) {
-        Server server = server(userId, serverId);
-        VlessInbound inbound = inbounds.findByServerIdAndTag(serverId, VlessInbound.DEFAULT_TAG)
-                .orElseThrow(VlessNotFoundException::new);
-        return lock.withLock(serverId, () -> createLocked(server, inbound, request));
+        // Проверяем владельца до блокировки, чтобы чужой serverId не создавал
+        // запись в карте блокировок. Внутри блокировки данные перечитываются.
+        server(userId, serverId);
+        return lock.withLock(serverId, () -> {
+            Server server = server(userId, serverId);
+            VlessInbound inbound = inbounds.findByServerIdAndTag(serverId, VlessInbound.DEFAULT_TAG)
+                    .orElseThrow(VlessNotFoundException::new);
+            return createLocked(server, inbound, request);
+        });
     }
 
     private VlessClientCreationResponse createLocked(Server server, VlessInbound inbound, VlessClientRequest request) {
@@ -60,7 +67,7 @@ public class VlessClientService {
 
         String uuid = UUID.randomUUID().toString();
         String email = email(uuid);
-        VlessClient client = clients.save(new VlessClient(inbound.getId(), name, email, config.encryptUuid(uuid)));
+        VlessClient client = new VlessClient(inbound.getId(), name, email, config.encryptUuid(uuid));
         client.setTrafficLimitBytes(normalizeLimit(request.trafficLimitBytes()));
         client.setExpiresAt(request.expiresAt());
         client = clients.save(client);
@@ -79,8 +86,7 @@ public class VlessClientService {
     }
 
     public VlessClientCreationResponse update(UUID userId, UUID clientId, VlessClientUpdateRequest request) {
-        Context context = load(userId, clientId);
-        return lock.withLock(context.server.getId(), () -> updateLocked(context, request));
+        return withClientLock(userId, clientId, context -> updateLocked(context, request));
     }
 
     private VlessClientCreationResponse updateLocked(Context context, VlessClientUpdateRequest request) {
@@ -94,34 +100,44 @@ public class VlessClientService {
         String oldUuid = config.uuid(client);
         String newUuid = rotate ? UUID.randomUUID().toString() : oldUuid;
 
+        // Сначала проверяем ввод, потом меняем удалённый конфиг: иначе
+        // невалидное имя оставит сервер и БД в разных состояниях.
+        String name = client.getName();
+        if (request.name() != null) {
+            name = request.name().trim();
+            if (name.isEmpty()) throw new IllegalArgumentException("name must not be blank");
+        }
+
+        Long limit = client.getTrafficLimitBytes();
+        if (Boolean.TRUE.equals(request.clearTrafficLimit())) {
+            limit = null;
+        } else if (request.trafficLimitBytes() != null) {
+            limit = normalizeLimit(request.trafficLimitBytes());
+        }
+
+        Instant expiresAt = client.getExpiresAt();
+        if (Boolean.TRUE.equals(request.clearExpiresAt())) {
+            expiresAt = null;
+        } else if (request.expiresAt() != null) {
+            expiresAt = request.expiresAt();
+        }
+
         applyRemote(server, inbound, client, wasEnabled, enabled, rotate, newUuid);
 
-        if (request.name() != null) {
-            String name = request.name().trim();
-            if (name.isEmpty()) throw new IllegalArgumentException("name must not be blank");
-            client.setName(name);
+        if (rotate) {
+            clients.updateSettingsAndUuid(client.getId(), name, enabled, expiresAt, limit,
+                    config.encryptUuid(newUuid));
+        } else {
+            clients.updateSettings(client.getId(), name, enabled, expiresAt, limit);
         }
-        if (Boolean.TRUE.equals(request.clearTrafficLimit())) {
-            client.setTrafficLimitBytes(null);
-        } else if (request.trafficLimitBytes() != null) {
-            client.setTrafficLimitBytes(normalizeLimit(request.trafficLimitBytes()));
-        }
-        if (Boolean.TRUE.equals(request.clearExpiresAt())) {
-            client.setExpiresAt(null);
-        } else if (request.expiresAt() != null) {
-            client.setExpiresAt(request.expiresAt());
-        }
-        client.setEnabled(enabled);
-        if (rotate) client.setEncryptedUuid(config.encryptUuid(newUuid));
-        client = clients.save(client);
 
-        return new VlessClientCreationResponse(VlessClientResponse.from(client),
-                uriBuilder.uri(server, inbound, client, newUuid));
+        VlessClient updated = clients.findById(client.getId()).orElseThrow(VlessNotFoundException::new);
+        return new VlessClientCreationResponse(VlessClientResponse.from(updated),
+                uriBuilder.uri(server, inbound, updated, newUuid));
     }
 
     public void delete(UUID userId, UUID clientId) {
-        Context context = load(userId, clientId);
-        lock.withLock(context.server.getId(), () -> {
+        withClientLock(userId, clientId, context -> {
             if (context.client.isEnabled()) {
                 requirePinned(context.server);
                 List<VlessClient> selected = config.all(context.inbound).stream()
@@ -131,6 +147,7 @@ public class VlessClientService {
                         config.configFor(context.inbound, selected, Map.of()), context.client.getEmail());
             }
             clients.delete(context.client);
+            return null;
         });
     }
 
@@ -143,23 +160,42 @@ public class VlessClientService {
 
     /**
      * Вызывается мониторингом при превышении лимита или истечении срока.
-     * Отключение обязательно подтверждается на самом сервере.
+     * Клиент перечитывается и лимит перепроверяется под блокировкой: между
+     * сбором метрик и этим вызовом пользователь мог поднять лимит, продлить
+     * срок или удалить клиента. Возвращает true, только если клиент реально
+     * отключён и на сервере, и в БД.
      */
-    public void disableForLimit(UUID clientId) {
-        VlessClient client = clients.findById(clientId).orElseThrow(VlessNotFoundException::new);
-        if (!client.isEnabled()) return;
-        VlessInbound inbound = inbounds.findById(client.getInboundId()).orElseThrow(VlessNotFoundException::new);
-        Server server = servers.findById(inbound.getServerId()).orElseThrow(VlessNotFoundException::new);
-        lock.withLock(server.getId(), () -> {
+    public boolean disableForLimit(UUID clientId) {
+        VlessClient snapshot = clients.findById(clientId).orElse(null);
+        if (snapshot == null || !snapshot.isEnabled()) return false;
+        VlessInbound inbound = inbounds.findById(snapshot.getInboundId())
+                .orElseThrow(VlessNotFoundException::new);
+        Server server = servers.findById(inbound.getServerId())
+                .orElseThrow(VlessNotFoundException::new);
+        return lock.withLock(server.getId(), () -> {
+            VlessClient current = clients.findById(clientId).orElse(null);
+            if (current == null || !current.isEnabled()) return false;
+            if (!limitReached(current, Instant.now())) return false;
+
             requirePinned(server);
             List<VlessClient> selected = config.all(inbound).stream()
-                    .filter(item -> item.isEnabled() && !item.getId().equals(client.getId()))
+                    .filter(item -> item.isEnabled() && !item.getId().equals(current.getId()))
                     .toList();
-            remote.removeClient(server, inbound, config.configFor(inbound, selected, Map.of()), client.getEmail());
-            client.setEnabled(false);
-            clients.save(client);
+            remote.removeClient(server, inbound, config.configFor(inbound, selected, Map.of()),
+                    current.getEmail());
+            // Точечное обновление вместо save(): detached-сущность после
+            // удаления строки не должна вставить клиента обратно.
+            clients.disable(current.getId());
             log.info("VLESS client {} disabled after reaching its limit", clientId);
+            return true;
         });
+    }
+
+    private boolean limitReached(VlessClient client, Instant now) {
+        boolean expired = client.getExpiresAt() != null && !client.getExpiresAt().isAfter(now);
+        boolean overTraffic = client.getTrafficLimitBytes() != null
+                && client.getTrafficUsedBytes() >= client.getTrafficLimitBytes();
+        return expired || overTraffic;
     }
 
     private void applyRemote(Server server, VlessInbound inbound, VlessClient client,
@@ -206,6 +242,17 @@ public class VlessClientService {
         Server server = servers.findByIdAndUserId(inbound.getServerId(), userId)
                 .orElseThrow(VlessNotFoundException::new);
         return new Context(server, inbound, client);
+    }
+
+    /**
+     * Ключ блокировки — serverId, поэтому сначала нужен только минимальный
+     * снимок. Все изменяемые сущности перечитываются уже под блокировкой.
+     */
+    private <T> T withClientLock(UUID userId, UUID clientId, Function<Context, T> action) {
+        VlessClient peek = clients.findById(clientId).orElseThrow(VlessNotFoundException::new);
+        VlessInbound inbound = inbounds.findById(peek.getInboundId())
+                .orElseThrow(VlessNotFoundException::new);
+        return lock.withLock(inbound.getServerId(), () -> action.apply(load(userId, clientId)));
     }
 
     private void requirePinned(Server server) {

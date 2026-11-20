@@ -4,6 +4,7 @@ import com.example.vlesswarden.crypto.CryptoService;
 import com.example.vlesswarden.server.Server;
 import com.example.vlesswarden.server.ServerNotFoundException;
 import com.example.vlesswarden.server.ServerRepository;
+import com.example.vlesswarden.server.ServerStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -55,57 +56,77 @@ public class VlessProvisioningService {
      * уже выданные клиентам vless:// ссылки.
      */
     public VlessInboundResponse provision(UUID userId, UUID serverId, VlessProvisionRequest request) {
-        Server server = servers.findByIdAndUserId(serverId, userId).orElseThrow(ServerNotFoundException::new);
-        requirePinned(server);
         VlessProvisionRequest req = request == null
                 ? new VlessProvisionRequest(null, null, null, null, null, null)
                 : request;
 
         int port = req.listenPort() == null ? DEFAULT_PORT : req.listenPort();
-        validatePort(port, server.getSshPort());
-
         String dest = validateDest(req.dest());
         List<String> serverNames = validateServerNames(req.serverNames(), destHost(dest));
         List<String> shortIds = validateShortIds(req.shortIds());
         String fingerprint = validateFingerprint(req.fingerprint());
         String flow = validateFlow(req.flow());
 
-        return lock.withLock(serverId, () -> provisionLocked(server, port, dest, serverNames, shortIds, fingerprint, flow));
+        // Всё перечитывается и проверяется под блокировкой.
+        return lock.withLock(serverId, () -> {
+            Server server = servers.findByIdAndUserId(serverId, userId)
+                    .orElseThrow(ServerNotFoundException::new);
+            requirePinned(server);
+            validatePort(port, server.getSshPort());
+            return provisionLocked(server, port, dest, serverNames, shortIds, fingerprint, flow);
+        });
     }
 
     private VlessInboundResponse provisionLocked(Server server, int port, String dest, List<String> serverNames,
                                                   List<String> shortIds, String fingerprint, String flow) {
         UUID serverId = server.getId();
-        VlessInbound inbound = inbounds.findByServerIdAndTag(serverId, VlessInbound.DEFAULT_TAG).orElse(null);
-        if (inbound == null) {
-            VlessKeys.KeyPair keys = VlessKeys.generateRealityKeyPair();
-            inbound = inbounds.save(new VlessInbound(serverId, VlessInbound.DEFAULT_TAG, port, dest,
-                    String.join(",", serverNames), String.join(",", shortIds), keys.publicKey(),
-                    crypto.encrypt(keys.privateKey().getBytes(StandardCharsets.UTF_8)), fingerprint, flow));
-        } else {
-            inbound.applySettings(port, dest, String.join(",", serverNames),
-                    String.join(",", shortIds), fingerprint, flow);
-            inbound = inbounds.save(inbound);
-        }
+        VlessInbound existing = inbounds.findByServerIdAndTag(serverId, VlessInbound.DEFAULT_TAG).orElse(null);
+        String joinedNames = String.join(",", serverNames);
+        String joinedShortIds = String.join(",", shortIds);
 
-        Integer oldFirewallPort = inbound.getFirewallPort();
+        // Настройки копируем в detached-объект, а не меняем сущность БД: она
+        // сохранится только после успешного remote-provisioning, а при ошибке
+        // перечитается и помечается ERROR в исходном состоянии.
+        VlessKeys.KeyPair keys = existing == null ? VlessKeys.generateRealityKeyPair() : null;
+        VlessInbound candidate = existing != null
+                ? existing.withSettings(port, dest, joinedNames, joinedShortIds, fingerprint, flow)
+                : new VlessInbound(serverId, VlessInbound.DEFAULT_TAG, port, dest, joinedNames, joinedShortIds,
+                        keys.publicKey(), crypto.encrypt(keys.privateKey().getBytes(StandardCharsets.UTF_8)),
+                        fingerprint, flow);
+
+        Integer oldFirewallPort = existing == null ? null : existing.getFirewallPort();
         try {
-            String configJson = config.fullConfig(inbound);
+            String configJson = config.fullConfig(candidate);
             VlessRemoteService.ProvisionResult result = remote.provision(server, port, oldFirewallPort, configJson);
-            inbound.markReady(result.version());
-            if (result.firewallAdded()) {
-                inbound.markFirewallAdded(port);
-            } else if (oldFirewallPort != null && oldFirewallPort != port) {
-                // Скрипт удалил правило старого порта, новое уже существовало.
-                inbound.clearFirewallPort();
+
+            VlessInbound saved;
+            if (existing == null) {
+                candidate.markReady(result.version());
+                if (result.firewallAdded()) candidate.markFirewallAdded(port);
+                else if (oldFirewallPort != null && oldFirewallPort != port) candidate.clearFirewallPort();
+                saved = inbounds.save(candidate);
+            } else {
+                VlessInbound current = inbounds.findByServerIdAndTag(serverId, VlessInbound.DEFAULT_TAG)
+                        .orElseThrow(VlessNotFoundException::new);
+                current.applySettings(port, dest, joinedNames, joinedShortIds, fingerprint, flow);
+                current.markReady(result.version());
+                if (result.firewallAdded()) {
+                    current.markFirewallAdded(port);
+                } else if (oldFirewallPort != null && oldFirewallPort != port) {
+                    // Скрипт удалил правило старого порта, новое уже существовало.
+                    current.clearFirewallPort();
+                }
+                saved = inbounds.save(current);
             }
-            inbounds.save(inbound);
-            server.markOnline();
-            servers.save(server);
-            return VlessInboundResponse.from(inbound);
+            servers.updateStatus(serverId, ServerStatus.ONLINE, null);
+            return VlessInboundResponse.from(saved);
         } catch (RuntimeException e) {
-            inbound.markError(errorMessage(e));
-            inbounds.save(inbound);
+            if (existing != null) {
+                inbounds.findByServerIdAndTag(serverId, VlessInbound.DEFAULT_TAG).ifPresent(current -> {
+                    current.markError(errorMessage(e));
+                    inbounds.save(current);
+                });
+            }
             log.warn("VLESS provisioning failed for server {}: {}", serverId, errorMessage(e));
             throw e;
         }

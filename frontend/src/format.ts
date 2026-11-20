@@ -26,6 +26,13 @@ export function gbToBytes(value: string): number | null {
   return Math.round(number * 1024 * 1024 * 1024)
 }
 
+/** Обратное преобразование с достаточной точностью, чтобы пересохранить
+ * исходный лимит неизменным, когда пользователь не трогает поле. */
+export function gbFromBytes(value: number | null): string {
+  if (!value) return ''
+  return String(Number((value / (1024 * 1024 * 1024)).toFixed(3)))
+}
+
 export function daysFromNow(value: string): string | null {
   if (!value.trim()) return null
   const number = Number(value)
