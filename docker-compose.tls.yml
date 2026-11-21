@@ -117,7 +117,7 @@ services:
     # Статический адрес: nginx доверяет X-Real-IP только от него.
     networks:
       default:
-        ipv4_address: 172.28.0.10
+        ipv4_address: 10.28.0.10
     environment:
       APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN is required}
     # acme — сертификат Let's Encrypt для домена, internal — самоподписанный (IP, локальная сеть).
@@ -153,4 +153,4 @@ networks:
     name: vless-warden-tls
     ipam:
       config:
-        - subnet: 172.28.0.0/24
+        - subnet: 10.28.0.0/24
