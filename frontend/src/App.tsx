@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import vlessDragonLogo from './assets/vless-dragon.png'
 import { Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { api, ApiError, AUTH_EXPIRED_EVENT, TOKEN_KEY } from './api'
-import { bytes, clientLimit, dateTime, daysFromNow, gbFromBytes, gbToBytes, time } from './format'
+import { bytes, clientLimit, dateTime, daysFromNow, gbFromBytes, gbToBytes, ipLimit, time } from './format'
 import type {
   ClientMetric,
   ConfirmAction,
@@ -14,6 +14,7 @@ import type {
   VlessClient,
   VlessClientConfig,
   VlessClientCreation,
+  VlessClientIp,
   VlessInbound,
 } from './types'
 
@@ -489,6 +490,9 @@ export default function App() {
                     </div>
                   </div>
                   {!inboundReady && <div className="inline-note">Client actions are unavailable while the inbound is not ready.</div>}
+                  {inbound && !inbound.routingReady && clients.some(client => client.ipLimit) && (
+                    <div className="inline-note">Server is re-provisioning to enable IP limits; it will briefly reconnect.</div>
+                  )}
                   {clientsQuery.isLoading ? (
                     <div className="state-box">Loading client list…</div>
                   ) : clientsQuery.isError ? (
@@ -897,6 +901,7 @@ function ProvisionDialog({ token, serverId, inbound, onClose, onProvisioned, onE
 function ClientForm({ token, serverId, onCreated }: { token: string; serverId: string; onCreated: (created: VlessClientCreation) => void }) {
   const [name, setName] = useState('')
   const [trafficGb, setTrafficGb] = useState('')
+  const [ipLimit, setIpLimit] = useState('')
   const [durationDays, setDurationDays] = useState('')
   const [showLimits, setShowLimits] = useState(false)
   const [error, setError] = useState('')
@@ -908,6 +913,7 @@ function ClientForm({ token, serverId, onCreated }: { token: string; serverId: s
           name,
           trafficLimitBytes: gbToBytes(trafficGb),
           expiresAt: daysFromNow(durationDays),
+          ipLimit: ipLimit ? Number(ipLimit) : null,
         }),
       }),
     onSuccess: onCreated,
@@ -919,8 +925,8 @@ function ClientForm({ token, serverId, onCreated }: { token: string; serverId: s
       <form className="peer-form" onSubmit={event => { event.preventDefault(); setError(''); mutation.mutate() }}>
         <label>Client name<input autoFocus required maxLength={100} value={name} onChange={event => setName(event.target.value)} placeholder="e.g. Laptop" /></label>
         <div className="peer-form-actions">
-          <button type="button" className={`button quiet ${trafficGb || durationDays ? 'limits-active' : ''}`} onClick={() => setShowLimits(true)}>
-            ＋ {trafficGb || durationDays ? 'Edit limits' : 'Add limits'}
+          <button type="button" className={`button quiet ${trafficGb || ipLimit || durationDays ? 'limits-active' : ''}`} onClick={() => setShowLimits(true)}>
+            ＋ {trafficGb || ipLimit || durationDays ? 'Edit limits' : 'Add limits'}
           </button>
           <button className="button primary" disabled={mutation.isPending || !name.trim()}>
             {mutation.isPending ? <><span className="spinner" /> Adding client…</> : 'Create vless:// link'}
@@ -932,10 +938,12 @@ function ClientForm({ token, serverId, onCreated }: { token: string; serverId: s
         <LimitsDialog
           trafficGb={trafficGb}
           durationDays={durationDays}
+          ipLimit={ipLimit}
           onClose={() => setShowLimits(false)}
-          onSave={(traffic, days) => {
+          onSave={(traffic, days, ip) => {
             setTrafficGb(traffic)
             setDurationDays(days)
+            setIpLimit(ip)
             setShowLimits(false)
           }}
         />
@@ -944,9 +952,16 @@ function ClientForm({ token, serverId, onCreated }: { token: string; serverId: s
   )
 }
 
-function LimitsDialog({ trafficGb, durationDays, onClose, onSave }: { trafficGb: string; durationDays: string; onClose: () => void; onSave: (traffic: string, days: string) => void }) {
+function LimitsDialog({ trafficGb, durationDays, ipLimit, onClose, onSave }: {
+  trafficGb: string
+  durationDays: string
+  ipLimit: string
+  onClose: () => void
+  onSave: (traffic: string, days: string, ip: string) => void
+}) {
   const [traffic, setTraffic] = useState(trafficGb)
   const [days, setDays] = useState(durationDays)
+  const [ip, setIp] = useState(ipLimit)
   return (
     <div className="overlay" onMouseDown={event => event.target === event.currentTarget && onClose()}>
       <section className="dialog panel limits-dialog">
@@ -956,11 +971,13 @@ function LimitsDialog({ trafficGb, durationDays, onClose, onSave }: { trafficGb:
         <p className="dialog-copy">Limits are enforced by monitoring. Leave a field empty for unlimited usage.</p>
         <div className="form-stack">
           <label>Traffic limit (GB)<input type="number" step="0.1" min="0" value={traffic} onChange={event => setTraffic(event.target.value)} placeholder="Unlimited" /></label>
+          <label>IP limit (concurrent IPs)<input type="number" step="1" min="1" value={ip} onChange={event => setIp(event.target.value)} placeholder="Unlimited" /></label>
           <label>Usage limit (days)<input type="number" step="1" min="0" value={days} onChange={event => setDays(event.target.value)} placeholder="Unlimited" /></label>
         </div>
+        <p className="dialog-copy">Recommended: 2–3. Each unique IP is one entry; IPv6 is grouped by /64. Extra IPs are banned after a short grace period.</p>
         <div className="dialog-actions">
           <button className="button quiet" onClick={onClose}>Cancel</button>
-          <button className="button primary" onClick={() => onSave(traffic, days)}>Apply limits</button>
+          <button className="button primary" onClick={() => onSave(traffic, days, ip)}>Apply limits</button>
         </div>
       </section>
     </div>
@@ -1006,13 +1023,31 @@ function ClientEditDialog({ token, client, onClose, onSaved }: { token: string; 
   // иначе текущие значения и округления во вводе затирали бы реальные.
   const initialTraffic = gbFromBytes(client.trafficLimitBytes)
   const initialDuration = initialExpiryDays(client.expiresAt)
+  const initialIpLimit = client.ipLimit ? String(client.ipLimit) : ''
   const [trafficGb, setTrafficGb] = useState(initialTraffic)
   const [durationDays, setDurationDays] = useState(initialDuration)
+  const [ipLimitText, setIpLimitText] = useState(initialIpLimit)
   const [enabled, setEnabled] = useState(client.enabled)
   const [rotateUuid, setRotateUuid] = useState(false)
   const [error, setError] = useState('')
   const trafficChanged = trafficGb !== initialTraffic
   const expiresChanged = durationDays !== initialDuration
+  const ipLimitChanged = ipLimitText !== initialIpLimit
+  const ipList = useQuery({
+    queryKey: ['client-ips', token, client.id],
+    queryFn: () => api<VlessClientIp[]>(`/api/vless/clients/${client.id}/ips`, token),
+    enabled: !!token && !!client.id,
+  })
+  const resetIpLimits = useMutation({
+    mutationFn: () => api<VlessClient>(`/api/vless/clients/${client.id}/ip-limits/reset`, token, { method: 'POST' }),
+    onSuccess: () => {
+      setError('')
+      setIpLimitText(client.ipLimit ? String(client.ipLimit) : '')
+      void ipList.refetch()
+      onSaved(null)
+    },
+    onError: caught => setError(caught.message),
+  })
   const save = useMutation({
     mutationFn: () => {
       const body: Record<string, unknown> = { name: name.trim(), enabled, rotateUuid }
@@ -1025,6 +1060,11 @@ function ClientEditDialog({ token, client, onClose, onSaved }: { token: string; 
         const expiresAt = daysFromNow(durationDays)
         body.expiresAt = expiresAt
         body.clearExpiresAt = expiresAt === null
+      }
+      if (ipLimitChanged) {
+        const ip = ipLimitText ? Number(ipLimitText) : null
+        body.clearIpLimit = ip === null
+        if (ip !== null) body.ipLimit = ip
       }
       return api<VlessClientCreation>(`/api/vless/clients/${client.id}`, token, {
         method: 'PUT',
@@ -1045,6 +1085,8 @@ function ClientEditDialog({ token, client, onClose, onSaved }: { token: string; 
     save.mutate()
   }
 
+  const limits = [clientLimit(client), ipLimit(client)].filter(Boolean).join(' · ')
+
   return (
     <div className="overlay" onMouseDown={event => event.target === event.currentTarget && onClose()}>
       <section className="dialog panel">
@@ -1052,12 +1094,13 @@ function ClientEditDialog({ token, client, onClose, onSaved }: { token: string; 
         <div className="eyebrow">CLIENT / EDIT</div>
         <h2>Edit {client.name}</h2>
         <p className="dialog-copy">
-          Usage: {bytes(client.trafficUsedBytes)}{clientLimit(client) ? ` · ${clientLimit(client)}` : ''}. When limits are reached the client is disabled on the Xray server.
+          Usage: {bytes(client.trafficUsedBytes)}{limits ? ` · ${limits}` : ''}. When traffic or expiry limits are reached the client is disabled on the Xray server; extra IPs are banned.
         </p>
         <form onSubmit={submit} className="form-stack">
           <label>Client name<input value={name} onChange={event => setName(event.target.value)} maxLength={100} required /></label>
           <div className="field-row">
             <label>Traffic limit (GB)<input type="number" step="0.1" min="0" value={trafficGb} onChange={event => setTrafficGb(event.target.value)} placeholder="Unlimited" /></label>
+            <label>IP limit<input type="number" step="1" min="1" value={ipLimitText} onChange={event => setIpLimitText(event.target.value)} placeholder="Unlimited" /></label>
             <label>Usage limit (days)<input type="number" step="1" min="0" value={durationDays} onChange={event => { setDurationDays(event.target.value); if (!enabled && event.target.value) setEnabled(true) }} placeholder="Unlimited" /></label>
           </div>
           <label className="checkbox-label"><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} /> Enable client (keeps it in the Xray config)</label>
@@ -1068,6 +1111,34 @@ function ClientEditDialog({ token, client, onClose, onSaved }: { token: string; 
             <button className="button primary" disabled={save.isPending}>{save.isPending ? <><span className="spinner" /> Saving…</> : 'Save'}</button>
           </div>
         </form>
+        <div className="ip-limits-block">
+          <div className="panel-header">
+            <div className="eyebrow">IP LIMITS · {ipList.data?.length ?? 0} known IPs</div>
+            <button
+              type="button"
+              className="button quiet"
+              disabled={resetIpLimits.isPending || !client.id}
+              onClick={() => resetIpLimits.mutate()}
+            >
+              Reset IP limits
+            </button>
+          </div>
+          {resetIpLimits.isError && <div className="form-error">{resetIpLimits.error.message}</div>}
+          <div className="ip-list">
+            {ipList.isLoading ? (
+              <div className="state-box">Loading IP history…</div>
+            ) : ipList.data?.length ? (
+              ipList.data.map(value => (
+                <div key={value.ip} className={`ip-row ${value.blocked ? 'blocked' : ''}`}>
+                  <span className="mono">{value.ip}</span>
+                  <span className={value.blocked ? 'error-text' : ''}>{value.blocked ? `banned · ${dateTime(value.blockedUntil)}` : `ok · ${dateTime(value.lastSeen)}`}</span>
+                </div>
+              ))
+            ) : (
+              <div className="state-box">No IP history yet.</div>
+            )}
+          </div>
+        </div>
       </section>
     </div>
   )
@@ -1112,7 +1183,13 @@ function ClientRow({ token, client, selected, disabled, onSelect, onEdit, onLink
     onError: caught => setError(caught.message),
   })
   const state = disabled || !client.enabled ? 'OFFLINE' : metrics.isError ? 'UNAVAILABLE' : metrics.isLoading ? 'CHECKING' : latest?.online ? 'ONLINE' : 'OFFLINE'
-  const limit = clientLimit(client)
+  const limit = [clientLimit(client), ipLimit(client)].filter(Boolean).join(' · ')
+  const resetIp = useMutation({
+    mutationFn: () =>
+      api<VlessClient>(`/api/vless/clients/${client.id}/ip-limits/reset`, token, { method: 'POST' }),
+    onSuccess: () => { setError(''); onChanged() },
+    onError: caught => setError(caught.message),
+  })
 
   return (
     <>
@@ -1124,6 +1201,15 @@ function ClientRow({ token, client, selected, disabled, onSelect, onEdit, onLink
         <td className="mono traffic">↓ {bytes(latest?.rxBytes ?? 0)}<br />↑ {bytes(latest?.txBytes ?? 0)}</td>
         <td className="actions">
           <button disabled={disabled} onClick={event => { event.stopPropagation(); onEdit() }}>EDIT</button>
+          {client.blockedIpCount > 0 && (
+            <button
+              className="reset-ip busy"
+              disabled={disabled || resetIp.isPending}
+              onClick={event => { event.stopPropagation(); setError(''); resetIp.mutate() }}
+            >
+              {resetIp.isPending ? 'Resetting…' : 'RESET IP'}
+            </button>
+          )}
           <button disabled={copy.isPending} onClick={event => { event.stopPropagation(); copy.mutate() }}>COPY</button>
           <button disabled={disabled || toggle.isPending} onClick={event => { event.stopPropagation(); setError(''); toggle.mutate() }}>
             {client.enabled ? 'DISABLE' : 'ENABLE'}

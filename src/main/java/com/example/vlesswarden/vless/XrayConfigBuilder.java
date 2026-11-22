@@ -26,7 +26,7 @@ public class XrayConfigBuilder {
         root.put("api", Map.of(
                 "tag", "api",
                 "listen", "127.0.0.1:10085",
-                "services", List.of("HandlerService", "StatsService")));
+                "services", List.of("HandlerService", "StatsService", "RoutingService")));
         root.put("stats", Map.of());
         root.put("policy", Map.of(
                 "levels", Map.of("0", Map.of(
@@ -34,7 +34,12 @@ public class XrayConfigBuilder {
                         "statsUserDownlink", true,
                         "statsUserOnline", true))));
         root.put("inbounds", List.of(inbound(inbound, privateKey, clients)));
-        root.put("outbounds", List.of(Map.of("protocol", "freedom", "tag", "direct")));
+        root.put("outbounds", List.of(
+                Map.of("protocol", "freedom", "tag", "direct"),
+                Map.of("protocol", "blackhole", "tag", "blocked")));
+        // Router должен существовать даже без runtime-правил: IP-баны
+        // добавляются через `xray api adrules`.
+        root.put("routing", Map.of("domainStrategy", "AsIs", "rules", List.of()));
         return write(root);
     }
 

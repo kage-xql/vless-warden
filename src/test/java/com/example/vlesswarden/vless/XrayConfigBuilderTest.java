@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -28,6 +29,14 @@ class XrayConfigBuilderTest {
         JsonNode root = mapper.readTree(json);
         assertEquals("127.0.0.1:10085", root.at("/api/listen").asText());
         assertTrue(root.at("/policy/levels/0/statsUserUplink").asBoolean());
+        List<String> services = new ArrayList<>();
+        root.at("/api/services").forEach(node -> services.add(node.asText()));
+        assertTrue(services.contains("RoutingService"));
+        assertEquals("freedom", root.at("/outbounds/0/protocol").asText());
+        assertEquals("blackhole", root.at("/outbounds/1/protocol").asText());
+        assertEquals("blocked", root.at("/outbounds/1/tag").asText());
+        assertEquals("AsIs", root.at("/routing/domainStrategy").asText());
+        assertEquals(0, root.at("/routing/rules").size());
         JsonNode inboundNode = root.at("/inbounds/0");
         assertEquals("raw", inboundNode.at("/streamSettings/network").asText());
         assertEquals("reality", inboundNode.at("/streamSettings/security").asText());

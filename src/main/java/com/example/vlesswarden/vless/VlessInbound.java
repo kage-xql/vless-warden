@@ -47,6 +47,10 @@ public class VlessInbound {
     private String xrayVersion;
     @Column(name = "firewall_port")
     private Integer firewallPort;
+    @Column(name = "routing_ready", nullable = false)
+    private boolean routingReady;
+    @Column(name = "rules_applied", nullable = false)
+    private boolean rulesApplied;
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -89,6 +93,8 @@ public class VlessInbound {
     public String getLastError() { return lastError; }
     public String getXrayVersion() { return xrayVersion; }
     public Integer getFirewallPort() { return firewallPort; }
+    public boolean isRoutingReady() { return routingReady; }
+    public boolean isRulesApplied() { return rulesApplied; }
     public Instant getCreatedAt() { return createdAt; }
 
     public List<String> serverNameList() {
@@ -137,6 +143,8 @@ public class VlessInbound {
         copy.lastError = this.lastError;
         copy.xrayVersion = this.xrayVersion;
         copy.firewallPort = this.firewallPort;
+        copy.routingReady = this.routingReady;
+        copy.rulesApplied = this.rulesApplied;
         copy.createdAt = this.createdAt;
         copy.enabled = true;
         return copy;
@@ -155,7 +163,26 @@ public class VlessInbound {
     public void markReady(String version) {
         this.status = "READY";
         this.lastError = null;
+        // Новый config.json всегда содержит RoutingService и blackhole,
+        // но runtime-правила после рестарта Xray теряются.
+        this.routingReady = true;
+        this.rulesApplied = false;
         if (version != null && !version.isBlank()) this.xrayVersion = version;
+    }
+
+    /** Конфиг уже содержит RoutingService; IP-баны можно применять через API. */
+    public void markRoutingReady() {
+        this.routingReady = true;
+    }
+
+    /** Runtime-правила маршрутизации сейчас применены к Xray. */
+    public void markRulesApplied() {
+        this.rulesApplied = true;
+    }
+
+    /** Runtime-правила сняты или потеряны после рестарта Xray. */
+    public void markRulesCleared() {
+        this.rulesApplied = false;
     }
 
     public void markError(String error) {

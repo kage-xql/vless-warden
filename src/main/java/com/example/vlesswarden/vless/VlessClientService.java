@@ -21,22 +21,27 @@ public class VlessClientService {
     private final ServerRepository servers;
     private final VlessInboundRepository inbounds;
     private final VlessClientRepository clients;
+    private final VlessClientIpRepository clientIps;
     private final VlessConfigService config;
     private final VlessRemoteService remote;
     private final VlessUriBuilder uriBuilder;
     private final VlessOperationLock lock;
+    private final VlessIpLimitService ipLimits;
 
     public VlessClientService(ServerRepository servers, VlessInboundRepository inbounds,
-                              VlessClientRepository clients, VlessConfigService config,
-                              VlessRemoteService remote, VlessUriBuilder uriBuilder,
-                              VlessOperationLock lock) {
+                              VlessClientRepository clients, VlessClientIpRepository clientIps,
+                              VlessConfigService config, VlessRemoteService remote,
+                              VlessUriBuilder uriBuilder, VlessOperationLock lock,
+                              VlessIpLimitService ipLimits) {
         this.servers = servers;
         this.inbounds = inbounds;
         this.clients = clients;
+        this.clientIps = clientIps;
         this.config = config;
         this.remote = remote;
         this.uriBuilder = uriBuilder;
         this.lock = lock;
+        this.ipLimits = ipLimits;
     }
 
     public List<VlessClientResponse> list(UUID userId, UUID serverId) {
@@ -69,6 +74,7 @@ public class VlessClientService {
         String email = email(uuid);
         VlessClient client = new VlessClient(inbound.getId(), name, email, config.encryptUuid(uuid));
         client.setTrafficLimitBytes(normalizeLimit(request.trafficLimitBytes()));
+        client.setIpLimit(normalizeIpLimit(request.ipLimit()));
         client.setExpiresAt(request.expiresAt());
         client = clients.save(client);
 
@@ -122,13 +128,35 @@ public class VlessClientService {
             expiresAt = request.expiresAt();
         }
 
+        Integer ipLimit = client.getIpLimit();
+        if (Boolean.TRUE.equals(request.clearIpLimit())) {
+            ipLimit = null;
+        } else if (request.ipLimit() != null) {
+            ipLimit = normalizeIpLimit(request.ipLimit());
+        }
+        boolean ipLimitCleared = ipLimit == null && client.getIpLimit() != null;
+
         applyRemote(server, inbound, client, wasEnabled, enabled, rotate, newUuid);
 
         if (rotate) {
-            clients.updateSettingsAndUuid(client.getId(), name, enabled, expiresAt, limit,
+            clients.updateSettingsAndUuid(client.getId(), name, enabled, expiresAt, limit, ipLimit,
                     config.encryptUuid(newUuid));
         } else {
-            clients.updateSettings(client.getId(), name, enabled, expiresAt, limit);
+            clients.updateSettings(client.getId(), name, enabled, expiresAt, limit, ipLimit);
+        }
+
+        if (ipLimitCleared) {
+            clientIps.deleteByClientId(client.getId());
+            clients.updateIpCounts(client.getId(), 0, 0);
+            // Снимаем и runtime-правила, иначе забаненный IP останется
+            // заблокированным до следующего цикла мониторинга. Ошибка SSH уже
+            // не должна отменять сохранённое изменение клиента: следующий
+            // цикл мониторинга повторит применение правил.
+            try {
+                ipLimits.apply(server.getId());
+            } catch (RuntimeException e) {
+                log.warn("Could not clear Xray IP rules for server {}: {}", server.getId(), e.getMessage());
+            }
         }
 
         VlessClient updated = clients.findById(client.getId()).orElseThrow(VlessNotFoundException::new);
@@ -156,6 +184,23 @@ public class VlessClientService {
         String uuid = config.uuid(context.client);
         return new VlessClientConfigResponse(context.client.getId(), context.client.getName(),
                 context.client.isEnabled(), uriBuilder.uri(context.server, context.inbound, context.client, uuid));
+    }
+
+    public List<VlessClientIpResponse> ips(UUID userId, UUID clientId) {
+        Context context = load(userId, clientId);
+        Instant now = Instant.now();
+        return clientIps.findAllByClientIdOrderByFirstSeenAsc(context.client.getId()).stream()
+                .map(value -> VlessClientIpResponse.from(value, now))
+                .toList();
+    }
+
+    /** Забывает все IP клиента и снимает его баны, не отключая сам клиент. */
+    public VlessClientResponse resetIpLimits(UUID userId, UUID clientId) {
+        return withClientLock(userId, clientId, context -> {
+            ipLimits.reset(context.server.getId(), context.client.getId());
+            VlessClient updated = clients.findById(clientId).orElseThrow(VlessNotFoundException::new);
+            return VlessClientResponse.from(updated);
+        });
     }
 
     /**
@@ -263,6 +308,10 @@ public class VlessClientService {
 
     private Long normalizeLimit(Long value) {
         return value == null || value == 0 ? null : value;
+    }
+
+    private Integer normalizeIpLimit(Integer value) {
+        return value == null || value <= 0 ? null : value;
     }
 
     private String email(String uuid) {

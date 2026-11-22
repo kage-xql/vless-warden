@@ -27,6 +27,7 @@ export type VlessInbound = {
   status: 'PENDING' | 'READY' | 'ERROR' | 'STOPPED'
   lastError: string | null
   xrayVersion: string | null
+  routingReady: boolean
 }
 
 export type VlessClient = {
@@ -38,6 +39,18 @@ export type VlessClient = {
   trafficUsedBytes: number
   expiresAt: string | null
   configAvailable: boolean
+  ipLimit: number | null
+  allowedIpCount: number
+  blockedIpCount: number
+  ipLimitExceeded: boolean
+}
+
+export type VlessClientIp = {
+  ip: string
+  firstSeen: string
+  lastSeen: string
+  blocked: boolean
+  blockedUntil: string | null
 }
 
 export type VlessClientCreation = { client: VlessClient; uri: string }

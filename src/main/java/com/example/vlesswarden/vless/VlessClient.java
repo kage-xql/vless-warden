@@ -27,6 +27,12 @@ public class VlessClient {
     private Long trafficLimitBytes;
     @Column(name = "traffic_used_bytes", nullable = false)
     private long trafficUsedBytes;
+    @Column(name = "ip_limit")
+    private Integer ipLimit;
+    @Column(name = "allowed_ip_count", nullable = false)
+    private int allowedIpCount;
+    @Column(name = "blocked_ip_count", nullable = false)
+    private int blockedIpCount;
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -54,6 +60,9 @@ public class VlessClient {
     public Instant getExpiresAt() { return expiresAt; }
     public Long getTrafficLimitBytes() { return trafficLimitBytes; }
     public long getTrafficUsedBytes() { return trafficUsedBytes; }
+    public Integer getIpLimit() { return ipLimit; }
+    public int getAllowedIpCount() { return allowedIpCount; }
+    public int getBlockedIpCount() { return blockedIpCount; }
     public Instant getCreatedAt() { return createdAt; }
 
     public void setName(String name) { this.name = name; }
@@ -61,6 +70,7 @@ public class VlessClient {
     public void setEnabled(boolean value) { this.enabled = value; }
     public void setExpiresAt(Instant value) { this.expiresAt = value; }
     public void setTrafficLimitBytes(Long value) { this.trafficLimitBytes = value; }
+    public void setIpLimit(Integer value) { this.ipLimit = value; }
 
     public void addTrafficUsedBytes(long delta) {
         if (delta > 0) this.trafficUsedBytes += delta;

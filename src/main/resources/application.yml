@@ -39,5 +39,10 @@ app:
   monitoring:
     retention: ${MONITORING_RETENTION:30d}
     interval: ${MONITORING_INTERVAL:60s}
+    ip-limit:
+      grace: ${IP_LIMIT_GRACE:2m}
+      stale-after: ${IP_LIMIT_STALE_AFTER:30m}
+      ban-ttl: ${IP_LIMIT_BAN_TTL:30m}
+      retry-after: ${IP_LIMIT_RETRY_AFTER:10m}
   vless:
     xray-version: ${XRAY_VERSION:v26.11.9}

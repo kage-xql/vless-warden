@@ -47,6 +47,16 @@ public class VlessController {
         return clients.config(user(authentication), clientId);
     }
 
+    @GetMapping("/vless/clients/{clientId}/ips")
+    public List<VlessClientIpResponse> ips(Authentication authentication, @PathVariable UUID clientId) {
+        return clients.ips(user(authentication), clientId);
+    }
+
+    @PostMapping("/vless/clients/{clientId}/ip-limits/reset")
+    public VlessClientResponse resetIpLimits(Authentication authentication, @PathVariable UUID clientId) {
+        return clients.resetIpLimits(user(authentication), clientId);
+    }
+
     @PutMapping("/vless/clients/{clientId}")
     public VlessClientCreationResponse update(Authentication authentication, @PathVariable UUID clientId,
                                               @Valid @RequestBody VlessClientUpdateRequest request) {

@@ -3,8 +3,10 @@ package com.example.vlesswarden.vless;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.Optional;
@@ -22,4 +24,9 @@ public interface VlessInboundRepository extends JpaRepository<VlessInbound, UUID
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select i from VlessInbound i where i.serverId = :serverId and i.tag = :tag")
     Optional<VlessInbound> lockByServerIdAndTag(@Param("serverId") UUID serverId, @Param("tag") String tag);
+
+    @Transactional
+    @Modifying
+    @Query("update VlessInbound i set i.rulesApplied = :applied where i.id = :id")
+    int updateRulesApplied(@Param("id") UUID id, @Param("applied") boolean applied);
 }

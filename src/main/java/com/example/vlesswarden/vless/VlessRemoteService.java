@@ -25,6 +25,11 @@ public class VlessRemoteService {
     }
 
     public ProvisionResult provision(Server server, int port, Integer oldFirewallPort, String configJson) {
+        return provision(server, port, oldFirewallPort, configJson, TimeUnit.MINUTES.toMillis(10));
+    }
+
+    public ProvisionResult provision(Server server, int port, Integer oldFirewallPort, String configJson,
+                                     long timeoutMillis) {
         if (port < 1 || port > 65535) throw new IllegalArgumentException("invalid listen port");
         int previousPort = oldFirewallPort != null && oldFirewallPort >= 1 && oldFirewallPort <= 65535
                 ? oldFirewallPort : 0;
@@ -35,7 +40,7 @@ public class VlessRemoteService {
                 .replace("{{OLD_PORT}}", Integer.toString(previousPort))
                 .replace("{{CONFIG_B64}}", java.util.Base64.getEncoder().encodeToString(
                         configJson.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-        String output = run(server, script, TimeUnit.MINUTES.toMillis(10));
+        String output = run(server, script, timeoutMillis);
         String version = value(output, "VLESS_VERSION");
         if (version.isBlank()) throw new IllegalStateException("Xray provisioning returned no version");
         return new ProvisionResult(version, "1".equals(value(output, "VLESS_FIREWALL")));
@@ -73,6 +78,15 @@ public class VlessRemoteService {
         String script = TEARDOWN_SCRIPT
                 .replace("{{FIREWALL_PORT}}", firewallPort == null ? "0" : Integer.toString(firewallPort));
         run(server, script, TimeUnit.MINUTES.toMillis(2));
+    }
+
+    /**
+     * Заменяет runtime-таблицу routing-правил Xray. Пустой список снимает
+     * все IP-баны. Правила живут в памяти и теряются при рестарте Xray.
+     */
+    public void applyIpRules(Server server, String rulesJson) {
+        String script = APPLY_RULES_SCRIPT.replace("{{RULES_B64}}", base64(rulesJson));
+        run(server, script, TimeUnit.MINUTES.toMillis(1));
     }
 
     private String run(Server server, String script, long timeoutMillis) {
@@ -360,6 +374,31 @@ public class VlessRemoteService {
               systemctl restart "$SERVICE" >/dev/null 2>&1 || true
               echo "Xray stopped after rotating a client" >&2
               exit 45
+            fi
+            """;
+
+    private static final String APPLY_RULES_SCRIPT = """
+            set -euo pipefail
+            exec 9>/run/lock/vless-warden.lock
+            flock -x 9
+            XRAY=/opt/vless-warden/bin/xray
+            rules_file=$(mktemp)
+            trap 'rm -f "$rules_file"' EXIT
+
+            printf '%s' '{{RULES_B64}}' | base64 -d > "$rules_file"
+            chmod 600 "$rules_file"
+            # adrules без -append заменяет всю таблицу правил. Проверяем и
+            # exit code, и текст: часть версий Xray печатает ошибку, но
+            # завершается успешно.
+            if ! output=$("$XRAY" api adrules --server=127.0.0.1:10085 "$rules_file" 2>&1); then
+              printf '%s\\n' "$output" >&2
+              echo "could not apply Xray routing rules" >&2
+              exit 50
+            fi
+            if printf '%s\\n' "$output" | grep -qiE 'failed|unknown service|not found'; then
+              printf '%s\\n' "$output" >&2
+              echo "Xray rejected routing rules" >&2
+              exit 51
             fi
             """;
 

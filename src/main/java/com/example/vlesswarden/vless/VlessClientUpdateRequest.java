@@ -12,6 +12,8 @@ public record VlessClientUpdateRequest(
         Boolean clearTrafficLimit,
         Instant expiresAt,
         Boolean clearExpiresAt,
-        Boolean rotateUuid
+        Boolean rotateUuid,
+        @PositiveOrZero Integer ipLimit,
+        Boolean clearIpLimit
 ) {
 }

@@ -5,6 +5,7 @@ import com.example.vlesswarden.server.ServerCredentialService;
 import com.example.vlesswarden.server.ServerRepository;
 import com.example.vlesswarden.server.ServerStatus;
 import com.example.vlesswarden.ssh.SshClientService;
+import com.example.vlesswarden.vless.IpAddresses;
 import com.example.vlesswarden.vless.VlessClient;
 import com.example.vlesswarden.vless.VlessClientMetric;
 import com.example.vlesswarden.vless.VlessClientMetricRepository;
@@ -13,6 +14,9 @@ import com.example.vlesswarden.vless.VlessClientRepository;
 import com.example.vlesswarden.vless.VlessClientService;
 import com.example.vlesswarden.vless.VlessInbound;
 import com.example.vlesswarden.vless.VlessInboundRepository;
+import com.example.vlesswarden.vless.VlessIpLimitService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -21,9 +25,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -68,6 +74,12 @@ public class MonitoringService {
                     }' || true
               { "$XRAY" api statsgetallonlineusers --server=127.0.0.1:10085 2>/dev/null || true; } \\
                 | grep -oE 'vw_[a-f0-9]{32}' | sed 's/^/ONL\\t/' || true
+              # statsonlineiplist -all отдаёт JSON; кодируем в base64, чтобы
+              # многострочный вывод не смешивался с TSV-строками метрик.
+              ipl=$("$XRAY" api statsonlineiplist --server=127.0.0.1:10085 -all 2>/dev/null || true)
+              if [ -n "$ipl" ]; then
+                printf 'IPL\\t%s\\n' "$(printf '%s' "$ipl" | base64 | tr -d '\\n')"
+              fi
             fi
             """;
 
@@ -79,16 +91,20 @@ public class MonitoringService {
     private final SshClientService ssh;
     private final ServerCredentialService credentials;
     private final VlessClientService clientService;
+    private final VlessIpLimitService ipLimits;
     private final MonitoringEventHub events;
     private final TransactionTemplate transactions;
     private final Duration retention;
+    private final ObjectMapper mapper;
 
     public MonitoringService(ServerRepository servers, VlessInboundRepository inbounds,
                              VlessClientRepository clients, ServerMetricRepository serverMetrics,
                              VlessClientMetricRepository clientMetrics, SshClientService ssh,
                              ServerCredentialService credentials, VlessClientService clientService,
+                             VlessIpLimitService ipLimits,
                              MonitoringEventHub events,
                              PlatformTransactionManager txManager,
+                             ObjectMapper mapper,
                              @Value("${app.monitoring.retention:30d}") Duration retention) {
         this.servers = servers;
         this.inbounds = inbounds;
@@ -98,8 +114,10 @@ public class MonitoringService {
         this.ssh = ssh;
         this.credentials = credentials;
         this.clientService = clientService;
+        this.ipLimits = ipLimits;
         this.events = events;
         this.transactions = new TransactionTemplate(txManager);
+        this.mapper = mapper;
         this.retention = retention;
     }
 
@@ -134,6 +152,13 @@ public class MonitoringService {
                         log.warn("Could not disable limited VLESS client {}", clientId, e);
                     }
                 }
+                // IP-баны применяются вне транзакции: SSH-вызов может
+                // занимать время, а блокировка на сервере мешала бы созданию/редактированию.
+                try {
+                    disabled.addAll(ipLimits.apply(id));
+                } catch (RuntimeException e) {
+                    log.warn("Could not apply IP limit rules for server {}", id, e);
+                }
                 List<MonitorUpdate.ClientUpdate> clients = result.update().clients().stream()
                         .map(client -> disabled.contains(client.clientId())
                                 ? new MonitorUpdate.ClientUpdate(client.clientId(), false, client.metrics())
@@ -164,6 +189,7 @@ public class MonitoringService {
         ServerMetric serverMetric = null;
         Map<String, long[]> traffic = new HashMap<>();
         Set<String> online = new HashSet<>();
+        Map<String, Set<String>> onlineIpByEmail = new HashMap<>();
 
         for (String line : output.lines().toList()) {
             String[] fields = line.split("\\t");
@@ -174,6 +200,8 @@ public class MonitoringService {
                 addTraffic(traffic, fields[1], counter(fields[2]));
             } else if (fields.length == 2 && fields[0].equals("ONL")) {
                 online.add(fields[1]);
+            } else if (fields.length == 2 && fields[0].equals("IPL")) {
+                onlineIpByEmail.putAll(parseOnlineIps(fields[1]));
             }
         }
         if (serverMetric == null) throw new IllegalStateException("remote metrics response is incomplete");
@@ -183,6 +211,8 @@ public class MonitoringService {
         List<UUID> pendingDisables = new ArrayList<>();
         for (VlessInbound inbound : inbounds.findAllByServerIdOrderByCreatedAtAsc(serverId)) {
             for (VlessClient client : clients.findAllByInboundIdOrderByCreatedAtDesc(inbound.getId())) {
+                ipLimits.evaluate(client, onlineIpByEmail.getOrDefault(client.getEmail(), Set.of()), now);
+
                 long[] current = traffic.getOrDefault(client.getEmail(), new long[]{0L, 0L});
                 Optional<VlessClientMetric> previous =
                         clientMetrics.findFirstByClientIdOrderByTimestampDesc(client.getId());
@@ -257,6 +287,34 @@ public class MonitoringService {
         long[] counters = traffic.computeIfAbsent(email, ignored -> new long[2]);
         if (direction.equals("uplink")) counters[0] = value;
         else if (direction.equals("downlink")) counters[1] = value;
+    }
+
+    private Map<String, Set<String>> parseOnlineIps(String base64Json) {
+        if (base64Json == null || base64Json.isBlank()) return Map.of();
+        try {
+            byte[] bytes = Base64.getDecoder().decode(base64Json);
+            JsonNode root = mapper.readTree(bytes);
+            Map<String, Set<String>> result = new HashMap<>();
+            for (JsonNode user : root.path("users")) {
+                String email = user.path("email").asText("");
+                if (email.isEmpty()) continue;
+                Set<String> ips = new HashSet<>();
+                for (JsonNode entry : user.path("ips")) {
+                    String ip = entry.path("ip").asText("");
+                    if (ip.isEmpty()) continue;
+                    try {
+                        ips.add(IpAddresses.normalize(ip));
+                    } catch (RuntimeException e) {
+                        log.debug("Ignoring unparseable online IP {}", ip);
+                    }
+                }
+                if (!ips.isEmpty()) result.put(email, ips);
+            }
+            return result;
+        } catch (Exception e) {
+            log.warn("Could not parse Xray online IP list: {}", e.getMessage());
+            return Map.of();
+        }
     }
 
     private double metric(String value) {

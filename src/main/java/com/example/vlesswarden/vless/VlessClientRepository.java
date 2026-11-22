@@ -7,12 +7,15 @@ import org.springframework.data.repository.query.Param;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 public interface VlessClientRepository extends JpaRepository<VlessClient, UUID> {
     List<VlessClient> findAllByInboundIdOrderByCreatedAtDesc(UUID inboundId);
+
+    List<VlessClient> findAllByInboundIdIn(Collection<UUID> inboundIds);
 
     Optional<VlessClient> findFirstByInboundIdAndEmail(UUID inboundId, String email);
 
@@ -28,11 +31,13 @@ public interface VlessClientRepository extends JpaRepository<VlessClient, UUID> 
                set c.name = :name,
                    c.enabled = :enabled,
                    c.expiresAt = :expiresAt,
-                   c.trafficLimitBytes = :limit
+                   c.trafficLimitBytes = :limit,
+                   c.ipLimit = :ipLimit
              where c.id = :id
             """)
     int updateSettings(@Param("id") UUID id, @Param("name") String name, @Param("enabled") boolean enabled,
-                       @Param("expiresAt") Instant expiresAt, @Param("limit") Long limit);
+                       @Param("expiresAt") Instant expiresAt, @Param("limit") Long limit,
+                       @Param("ipLimit") Integer ipLimit);
 
     @Transactional
     @Modifying
@@ -51,12 +56,14 @@ public interface VlessClientRepository extends JpaRepository<VlessClient, UUID> 
                    c.enabled = :enabled,
                    c.expiresAt = :expiresAt,
                    c.trafficLimitBytes = :limit,
+                   c.ipLimit = :ipLimit,
                    c.encryptedUuid = :uuid
              where c.id = :id
             """)
     int updateSettingsAndUuid(@Param("id") UUID id, @Param("name") String name,
                               @Param("enabled") boolean enabled, @Param("expiresAt") Instant expiresAt,
-                              @Param("limit") Long limit, @Param("uuid") byte[] uuid);
+                              @Param("limit") Long limit, @Param("ipLimit") Integer ipLimit,
+                              @Param("uuid") byte[] uuid);
 
     /** Атомарный инкремент: не перезаписывает остальные поля клиента. */
     @Transactional
@@ -72,4 +79,14 @@ public interface VlessClientRepository extends JpaRepository<VlessClient, UUID> 
     @Modifying
     @Query("update VlessClient c set c.enabled = false where c.id = :id")
     int disable(@Param("id") UUID id);
+
+    @Transactional
+    @Modifying
+    @Query("""
+            update VlessClient c
+               set c.allowedIpCount = :allowed,
+                   c.blockedIpCount = :blocked
+             where c.id = :id
+            """)
+    int updateIpCounts(@Param("id") UUID id, @Param("allowed") int allowed, @Param("blocked") int blocked);
 }

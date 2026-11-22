@@ -56,3 +56,9 @@ export function clientLimit(client: { trafficLimitBytes: number | null; expiresA
   }
   return parts.join(' · ')
 }
+
+export function ipLimit(client: { ipLimit: number | null; allowedIpCount: number; blockedIpCount: number }): string {
+  if (!client.ipLimit) return ''
+  const base = `IPs ${client.allowedIpCount}/${client.ipLimit}`
+  return client.blockedIpCount > 0 ? `${base} · banned ${client.blockedIpCount}` : base
+}

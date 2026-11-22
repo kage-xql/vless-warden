@@ -9,6 +9,7 @@ import java.time.Instant;
 public record VlessClientRequest(
         @NotBlank @Size(max = 100) String name,
         @PositiveOrZero Long trafficLimitBytes,
-        Instant expiresAt
+        Instant expiresAt,
+        @PositiveOrZero Integer ipLimit
 ) {
 }

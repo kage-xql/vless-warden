@@ -15,13 +15,15 @@ public record VlessInboundResponse(
         boolean enabled,
         String status,
         String lastError,
-        String xrayVersion
+        String xrayVersion,
+        boolean routingReady
 ) {
     static VlessInboundResponse from(VlessInbound inbound) {
         return new VlessInboundResponse(
                 inbound.getId(), inbound.getTag(), inbound.getListenPort(), inbound.getDest(),
                 inbound.getServerNames(), inbound.getShortIds(), inbound.getPublicKey(),
                 inbound.getFingerprint(), inbound.getFlow(), inbound.isEnabled(),
-                inbound.getStatus(), inbound.getLastError(), inbound.getXrayVersion());
+                inbound.getStatus(), inbound.getLastError(), inbound.getXrayVersion(),
+                inbound.isRoutingReady());
     }
 }
